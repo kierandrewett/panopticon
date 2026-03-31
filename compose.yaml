@@ -1,0 +1,15 @@
+services:
+  panopticon:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - TOKEN=${TOKEN}
+      - PORT=3000
+      - DATA_DIR=/data
+    volumes:
+      - data:/data
+    restart: unless-stopped
+
+volumes:
+  data:
