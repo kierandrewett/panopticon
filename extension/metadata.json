@@ -1,0 +1,8 @@
+{
+  "uuid": "panopticon@drewett.dev",
+  "name": "Panopticon",
+  "description": "Tracks mouse and keyboard activity and reports status to a remote server",
+  "shell-version": ["47", "48", "49"],
+  "settings-schema": "org.gnome.shell.extensions.panopticon",
+  "url": "https://github.com/kierandrewett/panopticon"
+}

@@ -1,1 +1,3 @@
 /target
+extension/*.zip
+extension/schemas/*.compiled

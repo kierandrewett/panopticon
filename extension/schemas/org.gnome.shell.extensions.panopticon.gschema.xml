@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.panopticon"
+          path="/org/gnome/shell/extensions/panopticon/">
+
+    <key name="url" type="s">
+      <default>'https://is-kieran.drewett.dev/active'</default>
+      <summary>Server URL</summary>
+      <description>The URL to POST activity status to</description>
+    </key>
+
+    <key name="token" type="s">
+      <default>''</default>
+      <summary>Bearer Token</summary>
+      <description>Bearer token for authorization</description>
+    </key>
+
+    <key name="idle-timeout" type="u">
+      <default>60</default>
+      <summary>Idle Timeout (seconds)</summary>
+      <description>Seconds of inactivity before reporting idle</description>
+    </key>
+
+    <key name="recent-pings" type="s">
+      <default>'[]'</default>
+      <summary>Recent Pings</summary>
+      <description>JSON array of recent ping entries [{timestamp, status, success}]</description>
+    </key>
+
+  </schema>
+</schemalist>
