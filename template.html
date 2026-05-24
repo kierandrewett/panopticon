@@ -29,10 +29,24 @@
             color: color-mix(in srgb, currentColor 50%, transparent 50%);
             margin-top: auto;
         }
+
+        .devices {
+            list-style: none;
+            padding: 0;
+            margin: 0 0 1em 0;
+            font-size: 0.85em;
+            color: color-mix(in srgb, currentColor 60%, transparent 40%);
+            text-align: center;
+        }
+
+        .devices li {
+            margin: 0.25em 0;
+        }
     </style>
 </head>
 <body>
     <h1>{{result}}</h1>
+    {{devices}}
     <small>since {{since}}</small>
 </body>
 </html>

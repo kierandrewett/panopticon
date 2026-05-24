@@ -98,13 +98,14 @@ export default class PanopticonExtension extends Extension {
     _sendStatus(status) {
         const url = this._settings.get_string('url');
         const token = this._settings.get_string('token');
+        const device = this._settings.get_string('device-id') || 'pc';
 
         if (!url || !token) {
             console.warn('[Panopticon] URL or token not configured');
             return;
         }
 
-        const body = JSON.stringify({status});
+        const body = JSON.stringify({status, device});
         const timestamp = new Date().toISOString();
 
         // Use Gio.Subprocess with curl — reliable across GNOME versions

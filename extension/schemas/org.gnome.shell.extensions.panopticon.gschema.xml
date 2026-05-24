@@ -21,6 +21,12 @@
       <description>Seconds of inactivity before reporting idle</description>
     </key>
 
+    <key name="device-id" type="s">
+      <default>'pc'</default>
+      <summary>Device ID</summary>
+      <description>Identifier sent with each status ping so the server can distinguish this device from others</description>
+    </key>
+
     <key name="recent-pings" type="s">
       <default>'[]'</default>
       <summary>Recent Pings</summary>

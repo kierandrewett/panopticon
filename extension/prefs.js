@@ -35,6 +35,16 @@ export default class PanopticonPreferences extends ExtensionPreferences {
         });
         group.add(tokenRow);
 
+        // Device ID
+        const deviceRow = new Adw.EntryRow({
+            title: 'Device ID',
+            text: settings.get_string('device-id'),
+        });
+        deviceRow.connect('changed', () => {
+            settings.set_string('device-id', deviceRow.get_text());
+        });
+        group.add(deviceRow);
+
         // Idle timeout
         const timeoutRow = new Adw.SpinRow({
             title: 'Idle Timeout',
