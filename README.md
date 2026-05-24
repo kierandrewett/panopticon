@@ -10,7 +10,7 @@ Panopticon monitors three signals to determine if you're active:
 - **Keyboard input** -- any key press
 - **Fullscreen apps** -- if the focused window is fullscreen, you're considered active even without input (useful for videos, games, etc.)
 
-The model is **poll-based**: every device should ping while it considers itself active. The server delists any device it hasn't heard from for 90 seconds. The public answer is `yes` while any device is still listed.
+The model is **poll-based**: every device should ping while it considers itself active. The server delists any device it hasn't heard from within its TTL (default 90 seconds). The public answer is `yes` while any device is still listed.
 
 The GNOME extension pings every 30 seconds while you're active. When idle (no input for the configured timeout, default 60s) it sends an explicit delist:
 
@@ -19,7 +19,11 @@ The GNOME extension pings every 30 seconds while you're active. When idle (no in
 {"device": "pc", "status": 0} // explicit delist (immediate, optional)
 ```
 
-`device` identifies the source. If omitted it falls back to `default`. Devices that just go silent are dropped after 90s — the explicit `status: 0` only exists to flip the public answer to `no` faster when going idle on a PC.
+`device` identifies the source (falls back to `default`). `ttl` (seconds) overrides how long this ping keeps the device listed — useful for low-frequency pollers like a phone that only fires hourly:
+
+```
+POST /active?device=phone&ttl=7200
+```
 
 ## Requirements
 
@@ -63,13 +67,29 @@ The preferences window also shows the last 20 status pings with timestamps and s
 
 ## iPhone Shortcut
 
-To report presence from your phone, create an iOS Shortcut with a *Get Contents of URL* action and run it on a schedule (e.g. every minute) via a *Personal Automation*:
+To report presence from your phone, create one Shortcut and three Personal Automations.
 
-- **URL**: `https://is-kieran.drewett.dev/active?device=phone`
+### The Shortcut
+
+In the *Shortcuts* app, tap *+* to create a new shortcut named e.g. **"Panopticon Active"**, then add a single *Get Contents of URL* action:
+
+- **URL**: `https://is-kieran.drewett.dev/active?device=phone&ttl=7200`
 - **Method**: `POST`
 - **Headers**: `Authorization: Bearer <your token>`
 
-The device id can be passed via the `?device=` query string (no body needed) or as JSON `{"device": "phone"}`. As long as the shortcut fires at least once every 90 seconds the phone stays listed.
+(`ttl=7200` keeps the phone listed for 2 hours per ping, so an hourly poll comfortably stays alive.)
+
+Make a near-identical second shortcut named **"Panopticon Idle"** with the URL `…/active?device=phone&status=0` for explicit delist.
+
+### The Automations
+
+In *Shortcuts → Automation → +*:
+
+1. **When I Arrive Home** → run *Panopticon Active*. (Disable "Ask Before Running".)
+2. **When I Leave Home** → run *Panopticon Idle*.
+3. **Time of Day, every hour, repeat Daily** → a small wrapper shortcut that first uses *Get Current Location*, then *If* the distance to your home address is less than ~200m, run *Panopticon Active*. Otherwise do nothing.
+
+The arrive/leave pair gives instant feedback; the hourly check refreshes the TTL while you're at home so the server doesn't expire you.
 
 ## Building
 

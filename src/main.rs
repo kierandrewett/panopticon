@@ -14,9 +14,9 @@ use tracing_subscriber::FmtSubscriber;
 
 const DISPLAY_TZ_NAME: &str = "Europe/London";
 const DEFAULT_DEVICE: &str = "default";
-/// Devices not seen for this long are pruned and stop contributing to the
-/// aggregate. Expected client ping cadence is well under this (e.g. 30s).
-const DEVICE_TTL_SECONDS: i64 = 90;
+/// Default TTL applied to a ping that doesn't specify one. Suits a chatty
+/// poller like the GNOME extension (pings every 30s).
+const DEFAULT_DEVICE_TTL_SECONDS: i64 = 90;
 
 fn state_file_path() -> std::path::PathBuf {
     let dir = std::env::var("DATA_DIR").unwrap_or_else(|_| ".".to_string());
@@ -26,6 +26,7 @@ fn state_file_path() -> std::path::PathBuf {
 #[derive(Serialize, Deserialize, Clone)]
 struct DeviceState {
     last_seen: chrono::DateTime<chrono::Utc>,
+    ttl_seconds: i64,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -63,6 +64,11 @@ struct UpdateRequest {
     status: Option<i8>,
     #[serde(default)]
     device: Option<String>,
+    /// Seconds this ping should keep the device listed. Defaults to 90s if
+    /// neither body nor query specify; useful for low-frequency pollers
+    /// (e.g. an iPhone Shortcut firing hourly).
+    #[serde(default)]
+    ttl: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -71,6 +77,8 @@ struct UpdateQuery {
     device: Option<String>,
     #[serde(default)]
     status: Option<i8>,
+    #[serde(default)]
+    ttl: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -108,7 +116,7 @@ fn format_since(dt: chrono::DateTime<chrono::Utc>) -> String {
     )
 }
 
-/// Drop devices whose `last_seen` is older than the TTL. Returns the latest
+/// Drop devices whose `last_seen + ttl` is in the past. Returns the latest
 /// expiry instant among pruned devices (useful for setting aggregate_since).
 fn prune_devices(
     devices: &mut HashMap<String, DeviceState>,
@@ -116,9 +124,9 @@ fn prune_devices(
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let mut latest_expiry: Option<chrono::DateTime<chrono::Utc>> = None;
     devices.retain(|_, d| {
-        let alive = (now - d.last_seen).num_seconds() < DEVICE_TTL_SECONDS;
+        let expiry = d.last_seen + chrono::Duration::seconds(d.ttl_seconds);
+        let alive = expiry > now;
         if !alive {
-            let expiry = d.last_seen + chrono::Duration::seconds(DEVICE_TTL_SECONDS);
             latest_expiry = latest_expiry.map(|t| t.max(expiry)).or(Some(expiry));
         }
         alive
@@ -176,11 +184,11 @@ fn parse_update(
         match trimmed.parse::<i8>() {
             Ok(n) => UpdateRequest {
                 status: Some(n),
-                device: None,
+                ..Default::default()
             },
             Err(_) => UpdateRequest {
-                status: None,
                 device: Some(trimmed.to_string()),
+                ..Default::default()
             },
         }
     } else {
@@ -192,6 +200,9 @@ fn parse_update(
     }
     if req.status.is_none() {
         req.status = query.status;
+    }
+    if req.ttl.is_none() {
+        req.ttl = query.ttl;
     }
 
     Ok(req)
@@ -237,10 +248,18 @@ async fn update_status(
             tracing::info!("Device '{}' delisted", device_id);
         }
     } else {
-        state
-            .devices
-            .insert(device_id.clone(), DeviceState { last_seen: now });
-        tracing::debug!("Device '{}' refreshed", device_id);
+        let ttl_seconds = req
+            .ttl
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_DEVICE_TTL_SECONDS);
+        state.devices.insert(
+            device_id.clone(),
+            DeviceState {
+                last_seen: now,
+                ttl_seconds,
+            },
+        );
+        tracing::debug!("Device '{}' refreshed (ttl {}s)", device_id, ttl_seconds);
     }
 
     refresh_aggregate(&mut state, now);
