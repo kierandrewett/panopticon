@@ -10,6 +10,7 @@ export default class PanopticonExtension extends Extension {
     _pointerListener = null;
     _idleTimeoutId = null;
     _keyPressId = null;
+    _forcePingId = null;
     _isActive = false;
     _lastActivity = 0;
 
@@ -30,6 +31,11 @@ export default class PanopticonExtension extends Extension {
         this._keyPressId = stage.connect('key-press-event', () => {
             this._onActivity();
             return Clutter.EVENT_PROPAGATE;
+        });
+
+        // Manual resend from prefs UI
+        this._forcePingId = this._settings.connect('changed::force-ping', () => {
+            this._sendStatus(this._isActive ? 1 : 0);
         });
 
         // Check for idle periodically (every 5 seconds)
@@ -60,6 +66,11 @@ export default class PanopticonExtension extends Extension {
         if (this._idleTimeoutId) {
             GLib.source_remove(this._idleTimeoutId);
             this._idleTimeoutId = null;
+        }
+
+        if (this._forcePingId && this._settings) {
+            this._settings.disconnect(this._forcePingId);
+            this._forcePingId = null;
         }
 
         this._settings = null;
@@ -98,7 +109,7 @@ export default class PanopticonExtension extends Extension {
     _sendStatus(status) {
         const url = this._settings.get_string('url');
         const token = this._settings.get_string('token');
-        const device = this._settings.get_string('device-id') || 'pc';
+        const device = this._settings.get_string('device-id').trim() || GLib.get_host_name();
 
         if (!url || !token) {
             console.warn('[Panopticon] URL or token not configured');

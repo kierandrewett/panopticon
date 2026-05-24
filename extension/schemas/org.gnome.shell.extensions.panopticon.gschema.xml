@@ -22,9 +22,15 @@
     </key>
 
     <key name="device-id" type="s">
-      <default>'pc'</default>
+      <default>''</default>
       <summary>Device ID</summary>
-      <description>Identifier sent with each status ping so the server can distinguish this device from others</description>
+      <description>Identifier sent with each status ping. Empty means use the system hostname.</description>
+    </key>
+
+    <key name="force-ping" type="u">
+      <default>0</default>
+      <summary>Force Ping Trigger</summary>
+      <description>Incremented from the prefs UI to ask the extension to immediately resend its current status</description>
     </key>
 
     <key name="recent-pings" type="s">

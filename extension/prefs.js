@@ -1,4 +1,5 @@
 import Adw from 'gi://Adw';
+import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import Gtk from 'gi://Gtk';
 
@@ -36,14 +37,32 @@ export default class PanopticonPreferences extends ExtensionPreferences {
         group.add(tokenRow);
 
         // Device ID
+        const hostname = GLib.get_host_name();
         const deviceRow = new Adw.EntryRow({
-            title: 'Device ID',
+            title: `Device ID (default: ${hostname})`,
             text: settings.get_string('device-id'),
         });
         deviceRow.connect('changed', () => {
             settings.set_string('device-id', deviceRow.get_text());
         });
         group.add(deviceRow);
+
+        // Force ping button
+        const pingRow = new Adw.ActionRow({
+            title: 'Send Ping Now',
+            subtitle: 'Force-resend the current status to the server',
+        });
+        const pingButton = new Gtk.Button({
+            label: 'Send',
+            valign: Gtk.Align.CENTER,
+        });
+        pingButton.add_css_class('suggested-action');
+        pingButton.connect('clicked', () => {
+            settings.set_uint('force-ping', settings.get_uint('force-ping') + 1);
+        });
+        pingRow.add_suffix(pingButton);
+        pingRow.set_activatable_widget(pingButton);
+        group.add(pingRow);
 
         // Idle timeout
         const timeoutRow = new Adw.SpinRow({
