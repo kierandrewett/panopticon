@@ -14,6 +14,9 @@ use tracing_subscriber::FmtSubscriber;
 
 const DISPLAY_TZ_NAME: &str = "Europe/London";
 const DEFAULT_DEVICE: &str = "default";
+/// Devices not seen for this long are pruned and stop contributing to the
+/// aggregate. Expected client ping cadence is well under this (e.g. 30s).
+const DEVICE_TTL_SECONDS: i64 = 90;
 
 fn state_file_path() -> std::path::PathBuf {
     let dir = std::env::var("DATA_DIR").unwrap_or_else(|_| ".".to_string());
@@ -22,52 +25,27 @@ fn state_file_path() -> std::path::PathBuf {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct DeviceState {
-    status: i8,
-    since: chrono::DateTime<chrono::Utc>,
-    /// Seconds after `since` an active ping is considered stale. None = never.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    ttl_seconds: Option<i64>,
+    last_seen: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct State {
     #[serde(default)]
     devices: HashMap<String, DeviceState>,
-}
-
-/// Legacy on-disk format before per-device tracking. Migrated into `default`.
-#[derive(Deserialize)]
-struct LegacyState {
-    status: i8,
-    since: chrono::DateTime<chrono::Utc>,
+    /// True at the moment of the last save. Compared to the freshly-computed
+    /// state on each request to detect active <-> inactive transitions.
+    #[serde(default)]
+    aggregate_active: bool,
+    /// When the aggregate active/inactive state last flipped.
+    #[serde(default)]
+    aggregate_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn load_state() -> State {
     let Ok(raw) = std::fs::read_to_string(state_file_path()) else {
         return State::default();
     };
-
-    if let Ok(state) = serde_json::from_str::<State>(&raw) {
-        if !state.devices.is_empty() {
-            return state;
-        }
-    }
-
-    if let Ok(legacy) = serde_json::from_str::<LegacyState>(&raw) {
-        let mut devices = HashMap::new();
-        devices.insert(
-            DEFAULT_DEVICE.to_string(),
-            DeviceState {
-                status: legacy.status,
-                since: legacy.since,
-                ttl_seconds: None,
-            },
-        );
-        tracing::info!("Migrated legacy state.json into device '{DEFAULT_DEVICE}'");
-        return State { devices };
-    }
-
-    State::default()
+    serde_json::from_str::<State>(&raw).unwrap_or_default()
 }
 
 fn save_state(state: &State) {
@@ -78,32 +56,27 @@ fn save_state(state: &State) {
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(load_state()));
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct UpdateRequest {
-    status: i8,
+    /// 1 (or omitted) = device is here. 0 = remove this device immediately.
+    #[serde(default)]
+    status: Option<i8>,
     #[serde(default)]
     device: Option<String>,
-    /// Optional TTL in seconds. After this many seconds an active ping
-    /// auto-decays to idle. Applies to this ping (persists for the device).
-    #[serde(default)]
-    ttl: Option<i64>,
 }
 
-#[derive(Serialize)]
-struct DeviceStatusResponse {
-    status: String,
-    since: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ttl_seconds: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stale: Option<bool>,
+#[derive(Deserialize, Default)]
+struct UpdateQuery {
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    status: Option<i8>,
 }
 
 #[derive(Serialize)]
 struct StatusResponse {
     status: String,
     since: String,
-    devices: HashMap<String, DeviceStatusResponse>,
 }
 
 const TEMPLATE_STR: &'static str = include_str!("../template.html");
@@ -124,81 +97,111 @@ fn ordinal_suffix(day: u32) -> &'static str {
     }
 }
 
-/// True if a device is currently effectively active (status=1 and not past TTL).
-fn device_effective_active(d: &DeviceState, now: chrono::DateTime<chrono::Utc>) -> bool {
-    if d.status != 1 {
-        return false;
-    }
-    match d.ttl_seconds {
-        Some(ttl) => (now - d.since).num_seconds() < ttl,
-        None => true,
-    }
+fn format_since(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let dt = dt.with_timezone(&London);
+    format!(
+        "{}{} {} ({})",
+        dt.day(),
+        ordinal_suffix(dt.day()),
+        dt.format("%b %Y %H:%M:%S"),
+        DISPLAY_TZ_NAME,
+    )
 }
 
-/// The instant a device most recently became (or will be reported as) idle.
-/// For an active, unexpired device this returns `since` (it isn't idle).
-fn device_idle_instant(
-    d: &DeviceState,
+/// Drop devices whose `last_seen` is older than the TTL. Returns the latest
+/// expiry instant among pruned devices (useful for setting aggregate_since).
+fn prune_devices(
+    devices: &mut HashMap<String, DeviceState>,
     now: chrono::DateTime<chrono::Utc>,
-) -> chrono::DateTime<chrono::Utc> {
-    if d.status == 0 {
-        return d.since;
-    }
-    match d.ttl_seconds {
-        Some(ttl) => {
-            let expiry = d.since + chrono::Duration::seconds(ttl);
-            if expiry <= now { expiry } else { now }
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let mut latest_expiry: Option<chrono::DateTime<chrono::Utc>> = None;
+    devices.retain(|_, d| {
+        let alive = (now - d.last_seen).num_seconds() < DEVICE_TTL_SECONDS;
+        if !alive {
+            let expiry = d.last_seen + chrono::Duration::seconds(DEVICE_TTL_SECONDS);
+            latest_expiry = latest_expiry.map(|t| t.max(expiry)).or(Some(expiry));
         }
-        None => now,
-    }
+        alive
+    });
+    latest_expiry
 }
 
-/// Returns (aggregate_status, aggregate_since).
-/// Active if any device is effectively active; "since" is the earliest such
-/// device's `since`. When idle, "since" is the most recent moment any device
-/// transitioned (or expired) to idle.
-fn compute_aggregate(
-    devices: &HashMap<String, DeviceState>,
+/// Prune, then return aggregate (active, since). Updates persisted
+/// `aggregate_since` only when the active/inactive state flips.
+fn refresh_aggregate(
+    state: &mut State,
     now: chrono::DateTime<chrono::Utc>,
-) -> (i8, chrono::DateTime<chrono::Utc>) {
-    let active_sinces: Vec<chrono::DateTime<chrono::Utc>> = devices
-        .values()
-        .filter(|d| device_effective_active(d, now))
-        .map(|d| d.since)
-        .collect();
+) -> (bool, chrono::DateTime<chrono::Utc>) {
+    let was_active = state.aggregate_active;
+    let latest_expiry = prune_devices(&mut state.devices, now);
+    let is_active = !state.devices.is_empty();
 
-    if let Some(earliest) = active_sinces.iter().min() {
-        return (1, *earliest);
+    if was_active != is_active {
+        let transition = if is_active {
+            state
+                .devices
+                .values()
+                .map(|d| d.last_seen)
+                .min()
+                .unwrap_or(now)
+        } else {
+            latest_expiry.unwrap_or(now)
+        };
+        state.aggregate_since = Some(transition);
+        state.aggregate_active = is_active;
+    } else if state.aggregate_since.is_none() {
+        state.aggregate_since = Some(now);
+        state.aggregate_active = is_active;
     }
 
-    let idle_since = devices
-        .values()
-        .map(|d| device_idle_instant(d, now))
-        .max()
-        .unwrap_or(now);
-    (0, idle_since)
+    (is_active, state.aggregate_since.unwrap())
 }
 
-fn parse_update_request(headers: &axum::http::HeaderMap, body: &str) -> Result<UpdateRequest, ()> {
+fn parse_update(
+    headers: &axum::http::HeaderMap,
+    query: &UpdateQuery,
+    body: &str,
+) -> Result<UpdateRequest, ()> {
     let content_type = headers
         .get("content-type")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    if content_type.contains("application/json") {
-        serde_json::from_str::<UpdateRequest>(body).map_err(|_| ())
+    let mut req = if content_type.contains("application/json") && !body.trim().is_empty() {
+        serde_json::from_str::<UpdateRequest>(body).map_err(|_| ())?
+    } else if !body.trim().is_empty() {
+        // Plain-text body: "0" or "1" sets status; anything else is treated
+        // as a device name (e.g. iPhone Shortcut posting raw text).
+        let trimmed = body.trim();
+        match trimmed.parse::<i8>() {
+            Ok(n) => UpdateRequest {
+                status: Some(n),
+                device: None,
+            },
+            Err(_) => UpdateRequest {
+                status: None,
+                device: Some(trimmed.to_string()),
+            },
+        }
     } else {
-        // Plain-text fallback: body is just "0" or "1", no device/ttl.
-        let status = body.trim().parse::<i8>().map_err(|_| ())?;
-        Ok(UpdateRequest {
-            status,
-            device: None,
-            ttl: None,
-        })
+        UpdateRequest::default()
+    };
+
+    if req.device.is_none() {
+        req.device = query.device.clone();
     }
+    if req.status.is_none() {
+        req.status = query.status;
+    }
+
+    Ok(req)
 }
 
-async fn update_status(headers: axum::http::HeaderMap, body: String) -> impl IntoResponse {
+async fn update_status(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<UpdateQuery>,
+    body: String,
+) -> impl IntoResponse {
     let auth = headers
         .get("authorization")
         .and_then(|h| h.to_str().ok())
@@ -208,10 +211,15 @@ async fn update_status(headers: axum::http::HeaderMap, body: String) -> impl Int
         return (axum::http::StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
-    let req = match parse_update_request(&headers, &body) {
-        Ok(r) if r.status == 0 || r.status == 1 => r,
-        _ => return (axum::http::StatusCode::BAD_REQUEST, "Invalid status").into_response(),
+    let req = match parse_update(&headers, &query, &body) {
+        Ok(r) => r,
+        Err(_) => return (axum::http::StatusCode::BAD_REQUEST, "Invalid body").into_response(),
     };
+
+    let status = req.status.unwrap_or(1);
+    if status != 0 && status != 1 {
+        return (axum::http::StatusCode::BAD_REQUEST, "Invalid status").into_response();
+    }
 
     let device_id = req
         .device
@@ -223,36 +231,20 @@ async fn update_status(headers: axum::http::HeaderMap, body: String) -> impl Int
 
     let mut state = STATE.lock().await;
     let now = chrono::Utc::now();
-    let existing = state.devices.get(&device_id);
 
-    let status_changed = existing.map(|d| d.status != req.status).unwrap_or(true);
-    let ttl_changed = existing
-        .map(|d| d.ttl_seconds != req.ttl)
-        .unwrap_or(req.ttl.is_some());
-
-    let new_device = DeviceState {
-        status: req.status,
-        since: if status_changed {
-            now
-        } else {
-            existing.unwrap().since
-        },
-        ttl_seconds: req.ttl,
-    };
-
-    if status_changed || ttl_changed {
-        state.devices.insert(device_id.clone(), new_device);
-        save_state(&state);
-        tracing::info!(
-            "Device '{}' -> status {} (ttl {:?})",
-            device_id,
-            req.status,
-            req.ttl
-        );
+    if status == 0 {
+        if state.devices.remove(&device_id).is_some() {
+            tracing::info!("Device '{}' delisted", device_id);
+        }
     } else {
-        // No-op refresh of an unchanged active ping.
-        state.devices.insert(device_id, new_device);
+        state
+            .devices
+            .insert(device_id.clone(), DeviceState { last_seen: now });
+        tracing::debug!("Device '{}' refreshed", device_id);
     }
+
+    refresh_aggregate(&mut state, now);
+    save_state(&state);
 
     "ok".into_response()
 }
@@ -261,17 +253,6 @@ async fn update_status(headers: axum::http::HeaderMap, body: String) -> impl Int
 struct GetParams {
     #[serde(default)]
     format: Option<String>,
-}
-
-fn format_since(dt: chrono::DateTime<chrono::Utc>) -> String {
-    let dt = dt.with_timezone(&London);
-    format!(
-        "{}{} {} ({})",
-        dt.day(),
-        ordinal_suffix(dt.day()),
-        dt.format("%b %Y %H:%M:%S"),
-        DISPLAY_TZ_NAME,
-    )
 }
 
 async fn get_status(
@@ -297,96 +278,31 @@ async fn get_status(
         _ => "html",
     };
 
-    let state = STATE.lock().await;
+    let mut state = STATE.lock().await;
     let now = chrono::Utc::now();
-    let (agg_status, agg_since) = compute_aggregate(&state.devices, now);
+    let prev_active = state.aggregate_active;
+    let (active, since_dt) = refresh_aggregate(&mut state, now);
+    if prev_active != active {
+        save_state(&state);
+    }
 
-    let result = match agg_status {
-        0 => "no",
-        1 => "yes",
-        _ => "invalid status",
-    };
-    let since = format_since(agg_since);
+    let result = if active { "yes" } else { "no" };
+    let since = format_since(since_dt);
 
     match format {
-        "json" => {
-            let devices = state
-                .devices
-                .iter()
-                .map(|(name, d)| {
-                    let active = device_effective_active(d, now);
-                    let stale = d.status == 1 && !active;
-                    (
-                        name.clone(),
-                        DeviceStatusResponse {
-                            status: if active { "yes" } else { "no" }.to_string(),
-                            since: format_since(d.since),
-                            ttl_seconds: d.ttl_seconds,
-                            stale: if stale { Some(true) } else { None },
-                        },
-                    )
-                })
-                .collect();
-
-            Json(StatusResponse {
-                status: result.to_string(),
-                since,
-                devices,
-            })
-            .into_response()
-        }
+        "json" => Json(StatusResponse {
+            status: result.to_string(),
+            since,
+        })
+        .into_response(),
         "text" => result.to_string().into_response(),
-        _ => {
-            let mut device_lines: Vec<(String, String)> = state
-                .devices
-                .iter()
-                .map(|(name, d)| {
-                    let active = device_effective_active(d, now);
-                    let label = if active {
-                        "active"
-                    } else if d.status == 1 {
-                        "stale"
-                    } else {
-                        "idle"
-                    };
-                    (name.clone(), format!("{label} since {}", format_since(d.since)))
-                })
-                .collect();
-            device_lines.sort_by(|a, b| a.0.cmp(&b.0));
-
-            let devices_html = if device_lines.is_empty() {
-                String::new()
-            } else {
-                let items: String = device_lines
-                    .into_iter()
-                    .map(|(name, line)| {
-                        format!(
-                            "<li><strong>{}</strong>: {}</li>",
-                            html_escape(&name),
-                            html_escape(&line)
-                        )
-                    })
-                    .collect();
-                format!("<ul class=\"devices\">{items}</ul>")
-            };
-
-            Html(
-                TEMPLATE_STR
-                    .replace("{{result}}", result)
-                    .replace("{{since}}", &since)
-                    .replace("{{devices}}", &devices_html),
-            )
-            .into_response()
-        }
+        _ => Html(
+            TEMPLATE_STR
+                .replace("{{result}}", result)
+                .replace("{{since}}", &since),
+        )
+        .into_response(),
     }
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 #[tokio::main]
@@ -402,10 +318,8 @@ async fn main() {
 
     let _ = get_token(); // Ensure TOKEN is set at startup
 
-    // build our application with a single route
     let app = Router::new().route("/", post(update_status).get(get_status));
 
-    // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind(&format!("0.0.0.0:{}", port))
         .await
         .unwrap();

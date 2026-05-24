@@ -9,6 +9,7 @@ export default class PanopticonExtension extends Extension {
     _settings = null;
     _pointerListener = null;
     _idleTimeoutId = null;
+    _pollTimeoutId = null;
     _keyPressId = null;
     _forcePingId = null;
     _isActive = false;
@@ -48,6 +49,18 @@ export default class PanopticonExtension extends Extension {
             },
         );
 
+        // Refresh active ping every 30s so the server's poll-based TTL
+        // never expires us while the user is at their machine.
+        this._pollTimeoutId = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT,
+            30,
+            () => {
+                if (this._isActive)
+                    this._sendStatus(1);
+                return GLib.SOURCE_CONTINUE;
+            },
+        );
+
         // Report active on enable
         this._onActivity();
     }
@@ -66,6 +79,11 @@ export default class PanopticonExtension extends Extension {
         if (this._idleTimeoutId) {
             GLib.source_remove(this._idleTimeoutId);
             this._idleTimeoutId = null;
+        }
+
+        if (this._pollTimeoutId) {
+            GLib.source_remove(this._pollTimeoutId);
+            this._pollTimeoutId = null;
         }
 
         if (this._forcePingId && this._settings) {

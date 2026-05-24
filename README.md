@@ -10,17 +10,16 @@ Panopticon monitors three signals to determine if you're active:
 - **Keyboard input** -- any key press
 - **Fullscreen apps** -- if the focused window is fullscreen, you're considered active even without input (useful for videos, games, etc.)
 
-When no activity is detected for the configured idle timeout (default: 60 seconds), the extension sends an `idle` status to the server. Activity resumes the moment any of the above signals are detected.
+The model is **poll-based**: every device should ping while it considers itself active. The server delists any device it hasn't heard from for 90 seconds. The public answer is `yes` while any device is still listed.
 
-Status is reported as a JSON POST request:
+The GNOME extension pings every 30 seconds while you're active. When idle (no input for the configured timeout, default 60s) it sends an explicit delist:
 
 ```json
-{"status": 1, "device": "pc"}            // active
-{"status": 0, "device": "pc"}            // idle
-{"status": 1, "device": "phone", "ttl": 1800}  // active, auto-decays after 30 min
+{"device": "pc"}              // active refresh (status=1 implicit)
+{"device": "pc", "status": 0} // explicit delist (immediate, optional)
 ```
 
-`device` identifies the source (defaults to `default` if omitted). The server tracks each device independently and reports the aggregate as `yes` if **any** device is active. `ttl` (seconds) is optional — useful for sources that only send "active" events (like a phone shortcut). After `ttl` elapses without another ping, the device is treated as idle.
+`device` identifies the source. If omitted it falls back to `default`. Devices that just go silent are dropped after 90s — the explicit `status: 0` only exists to flip the public answer to `no` faster when going idle on a PC.
 
 ## Requirements
 
@@ -57,24 +56,20 @@ gnome-extensions prefs panopticon@drewett.dev
 |---------|-------------|---------|
 | Server URL | URL to POST status updates to | `https://is-kieran.drewett.dev/active` |
 | Bearer Token | Authorization token sent in the `Authorization` header | *(empty)* |
-| Device ID | Identifier sent with each ping so the server can distinguish this device | `pc` |
+| Device ID | Identifier sent with each ping so the server can distinguish this device | *(hostname)* |
 | Idle Timeout | Seconds of inactivity before reporting idle (10--600) | `60` |
 
 The preferences window also shows the last 20 status pings with timestamps and success/failure indicators.
 
 ## iPhone Shortcut
 
-To report presence from your phone (e.g. when you're home but away from the PC), create an iOS Shortcut with a *Get Contents of URL* action:
+To report presence from your phone, create an iOS Shortcut with a *Get Contents of URL* action and run it on a schedule (e.g. every minute) via a *Personal Automation*:
 
-- **URL**: `https://is-kieran.drewett.dev/active`
+- **URL**: `https://is-kieran.drewett.dev/active?device=phone`
 - **Method**: `POST`
-- **Headers**: `Authorization: Bearer <your token>`, `Content-Type: application/json`
-- **Request Body** (JSON):
-  ```json
-  {"status": 1, "device": "phone", "ttl": 1800}
-  ```
+- **Headers**: `Authorization: Bearer <your token>`
 
-Trigger this from a *Personal Automation* (e.g. "When I arrive home"). The `ttl` ensures the phone falls back to idle automatically if the leave-home trigger doesn't fire. To report idle explicitly, send the same shortcut with `"status": 0`.
+The device id can be passed via the `?device=` query string (no body needed) or as JSON `{"device": "phone"}`. As long as the shortcut fires at least once every 90 seconds the phone stays listed.
 
 ## Building
 
