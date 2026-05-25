@@ -57,6 +57,48 @@ fn save_state(state: &State) {
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(load_state()));
 
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("failed to build webhook HTTP client")
+});
+
+/// POST a state-change notification to `WEBHOOK_URL` if configured. Fire and
+/// forget — the request runs on a detached task and failures are logged.
+fn fire_webhook(
+    device: String,
+    event: &'static str,
+    reason: &'static str,
+    aggregate_active: bool,
+) {
+    let url = match std::env::var("WEBHOOK_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => return,
+    };
+    let payload = serde_json::json!({
+        "device": device,
+        "event": event,
+        "reason": reason,
+        "aggregate_active": aggregate_active,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    tokio::spawn(async move {
+        match HTTP_CLIENT.post(&url).json(&payload).send().await {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    tracing::warn!(
+                        "Webhook {} returned status {}",
+                        url,
+                        resp.status()
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("Webhook to {} failed: {}", url, e),
+        }
+    });
+}
+
 #[derive(Deserialize, Default)]
 struct UpdateRequest {
     /// 1 (or omitted) = device is here. 0 = remove this device immediately.
@@ -84,6 +126,7 @@ struct UpdateQuery {
 #[derive(Serialize)]
 struct DeviceResponse {
     last_seen: String,
+    expires: String,
     ttl_seconds: i64,
 }
 
@@ -123,32 +166,45 @@ fn format_since(dt: chrono::DateTime<chrono::Utc>) -> String {
     )
 }
 
+struct PruneOutcome {
+    latest_expiry: Option<chrono::DateTime<chrono::Utc>>,
+    pruned: Vec<String>,
+}
+
 /// Drop devices whose `last_seen + ttl` is in the past. Returns the latest
-/// expiry instant among pruned devices (useful for setting aggregate_since).
+/// expiry instant among pruned devices and the names that were dropped.
 fn prune_devices(
     devices: &mut HashMap<String, DeviceState>,
     now: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    let mut latest_expiry: Option<chrono::DateTime<chrono::Utc>> = None;
-    devices.retain(|_, d| {
+) -> PruneOutcome {
+    let mut out = PruneOutcome {
+        latest_expiry: None,
+        pruned: Vec::new(),
+    };
+    devices.retain(|name, d| {
         let expiry = d.last_seen + chrono::Duration::seconds(d.ttl_seconds);
         let alive = expiry > now;
         if !alive {
-            latest_expiry = latest_expiry.map(|t| t.max(expiry)).or(Some(expiry));
+            out.latest_expiry = out.latest_expiry.map(|t| t.max(expiry)).or(Some(expiry));
+            out.pruned.push(name.clone());
         }
         alive
     });
-    latest_expiry
+    out
 }
 
-/// Prune, then return aggregate (active, since). Updates persisted
-/// `aggregate_since` only when the active/inactive state flips.
-fn refresh_aggregate(
-    state: &mut State,
-    now: chrono::DateTime<chrono::Utc>,
-) -> (bool, chrono::DateTime<chrono::Utc>) {
+struct AggregateOutcome {
+    active: bool,
+    since: chrono::DateTime<chrono::Utc>,
+    pruned: Vec<String>,
+}
+
+/// Prune, then return aggregate state and the names of devices that just
+/// expired. Updates persisted `aggregate_since` only when the active/
+/// inactive state flips.
+fn refresh_aggregate(state: &mut State, now: chrono::DateTime<chrono::Utc>) -> AggregateOutcome {
     let was_active = state.aggregate_active;
-    let latest_expiry = prune_devices(&mut state.devices, now);
+    let prune = prune_devices(&mut state.devices, now);
     let is_active = !state.devices.is_empty();
 
     if was_active != is_active {
@@ -160,7 +216,7 @@ fn refresh_aggregate(
                 .min()
                 .unwrap_or(now)
         } else {
-            latest_expiry.unwrap_or(now)
+            prune.latest_expiry.unwrap_or(now)
         };
         state.aggregate_since = Some(transition);
         state.aggregate_active = is_active;
@@ -169,7 +225,11 @@ fn refresh_aggregate(
         state.aggregate_active = is_active;
     }
 
-    (is_active, state.aggregate_since.unwrap())
+    AggregateOutcome {
+        active: is_active,
+        since: state.aggregate_since.unwrap(),
+        pruned: prune.pruned,
+    }
 }
 
 fn parse_update(
@@ -250,11 +310,15 @@ async fn update_status(
     let mut state = STATE.lock().await;
     let now = chrono::Utc::now();
 
+    let mut transition: Option<(&'static str, &'static str)> = None;
+
     if status == 0 {
         if state.devices.remove(&device_id).is_some() {
             tracing::info!("Device '{}' delisted", device_id);
+            transition = Some(("off", "explicit"));
         }
     } else {
+        let was_present = state.devices.contains_key(&device_id);
         let ttl_seconds = req
             .ttl
             .filter(|n| *n > 0)
@@ -267,10 +331,22 @@ async fn update_status(
             },
         );
         tracing::debug!("Device '{}' refreshed (ttl {}s)", device_id, ttl_seconds);
+        if !was_present {
+            transition = Some(("on", "ping"));
+        }
     }
 
-    refresh_aggregate(&mut state, now);
+    let outcome = refresh_aggregate(&mut state, now);
     save_state(&state);
+    let aggregate_active = outcome.active;
+    drop(state);
+
+    if let Some((event, reason)) = transition {
+        fire_webhook(device_id, event, reason, aggregate_active);
+    }
+    for name in outcome.pruned {
+        fire_webhook(name, "off", "expired", aggregate_active);
+    }
 
     "ok".into_response()
 }
@@ -307,9 +383,14 @@ async fn get_status(
     let mut state = STATE.lock().await;
     let now = chrono::Utc::now();
     let prev_active = state.aggregate_active;
-    let (active, since_dt) = refresh_aggregate(&mut state, now);
-    if prev_active != active {
+    let outcome = refresh_aggregate(&mut state, now);
+    let active = outcome.active;
+    let since_dt = outcome.since;
+    if prev_active != active || !outcome.pruned.is_empty() {
         save_state(&state);
+    }
+    for name in &outcome.pruned {
+        fire_webhook(name.clone(), "off", "expired", active);
     }
 
     let result = if active { "yes" } else { "no" };
@@ -321,10 +402,13 @@ async fn get_status(
                 .devices
                 .iter()
                 .map(|(name, d)| {
+                    let expires_at =
+                        d.last_seen + chrono::Duration::seconds(d.ttl_seconds);
                     (
                         name.clone(),
                         DeviceResponse {
                             last_seen: format_since(d.last_seen),
+                            expires: format_since(expires_at),
                             ttl_seconds: d.ttl_seconds,
                         },
                     )

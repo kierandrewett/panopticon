@@ -8,6 +8,7 @@ axum = { version = "0.8.8", features = ["tower-log"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 chrono-tz = "0.10.4"
 lazy_static = "1.5.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }

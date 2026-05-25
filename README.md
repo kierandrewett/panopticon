@@ -25,6 +25,28 @@ The GNOME extension pings every 30 seconds while you're active. When idle (no in
 POST /active?device=phone&ttl=7200
 ```
 
+## Webhooks
+
+Set `WEBHOOK_URL` on the server and Panopticon will POST a JSON event to it whenever any device transitions on or off:
+
+```json
+{
+  "device": "ac",
+  "event": "on" | "off",
+  "reason": "ping" | "explicit" | "expired",
+  "aggregate_active": true,
+  "timestamp": "2026-05-25T17:26:05.759137452+00:00"
+}
+```
+
+| `event` / `reason` | Fired when |
+|---|---|
+| `on` / `ping` | A previously-absent device sent its first ping |
+| `off` / `explicit` | A device sent `status=0` |
+| `off` / `expired` | A device's TTL elapsed without a refresh ping (covers unplugged-at-the-wall, lost-WiFi, manual off, schedule-off — anything that stops the device from pinging) |
+
+Refresh pings for an already-listed device do **not** fire a webhook.
+
 ## Requirements
 
 - GNOME Shell 47, 48, or 49
