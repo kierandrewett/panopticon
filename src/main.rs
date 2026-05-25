@@ -82,9 +82,16 @@ struct UpdateQuery {
 }
 
 #[derive(Serialize)]
+struct DeviceResponse {
+    last_seen: String,
+    ttl_seconds: i64,
+}
+
+#[derive(Serialize)]
 struct StatusResponse {
     status: String,
     since: String,
+    devices: HashMap<String, DeviceResponse>,
 }
 
 const TEMPLATE_STR: &'static str = include_str!("../template.html");
@@ -309,11 +316,27 @@ async fn get_status(
     let since = format_since(since_dt);
 
     match format {
-        "json" => Json(StatusResponse {
-            status: result.to_string(),
-            since,
-        })
-        .into_response(),
+        "json" => {
+            let devices = state
+                .devices
+                .iter()
+                .map(|(name, d)| {
+                    (
+                        name.clone(),
+                        DeviceResponse {
+                            last_seen: format_since(d.last_seen),
+                            ttl_seconds: d.ttl_seconds,
+                        },
+                    )
+                })
+                .collect();
+            Json(StatusResponse {
+                status: result.to_string(),
+                since,
+                devices,
+            })
+            .into_response()
+        }
         "text" => result.to_string().into_response(),
         _ => Html(
             TEMPLATE_STR
