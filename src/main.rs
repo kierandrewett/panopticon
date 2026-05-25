@@ -297,6 +297,10 @@ async fn update_status(
 struct GetParams {
     #[serde(default)]
     format: Option<String>,
+    /// Scope the response to a single device. yes/no answers whether that
+    /// device specifically is currently alive (ping within TTL).
+    #[serde(default)]
+    device: Option<String>,
 }
 
 async fn get_status(
@@ -326,33 +330,66 @@ async fn get_status(
     let now = chrono::Utc::now();
     let prev_active = state.aggregate_active;
     let outcome = refresh_aggregate(&mut state, now);
-    let active = outcome.active;
-    let since_dt = outcome.since;
-    if prev_active != active || !outcome.pruned.is_empty() {
+    let aggregate_active = outcome.active;
+    let aggregate_since = outcome.since;
+    if prev_active != aggregate_active || !outcome.pruned.is_empty() {
         save_state(&state);
     }
+
+    let device_filter = params
+        .device
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let (active, since_dt) = match device_filter {
+        Some(name) => match state.devices.get(name) {
+            Some(d) => (true, d.last_seen),
+            None => (false, aggregate_since),
+        },
+        None => (aggregate_active, aggregate_since),
+    };
 
     let result = if active { "yes" } else { "no" };
     let since = format_since(since_dt);
 
     match format {
         "json" => {
-            let devices = state
-                .devices
-                .iter()
-                .map(|(name, d)| {
-                    let expires_at =
-                        d.last_seen + chrono::Duration::seconds(d.ttl_seconds);
-                    (
-                        name.clone(),
-                        DeviceResponse {
-                            last_seen: format_since(d.last_seen),
-                            expires: format_since(expires_at),
-                            ttl_seconds: d.ttl_seconds,
-                        },
-                    )
-                })
-                .collect();
+            let devices = match device_filter {
+                Some(name) => state
+                    .devices
+                    .get(name)
+                    .map(|d| {
+                        let expires_at =
+                            d.last_seen + chrono::Duration::seconds(d.ttl_seconds);
+                        (
+                            name.to_string(),
+                            DeviceResponse {
+                                last_seen: format_since(d.last_seen),
+                                expires: format_since(expires_at),
+                                ttl_seconds: d.ttl_seconds,
+                            },
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+                None => state
+                    .devices
+                    .iter()
+                    .map(|(name, d)| {
+                        let expires_at =
+                            d.last_seen + chrono::Duration::seconds(d.ttl_seconds);
+                        (
+                            name.clone(),
+                            DeviceResponse {
+                                last_seen: format_since(d.last_seen),
+                                expires: format_since(expires_at),
+                                ttl_seconds: d.ttl_seconds,
+                            },
+                        )
+                    })
+                    .collect(),
+            };
             Json(StatusResponse {
                 status: result.to_string(),
                 since,
