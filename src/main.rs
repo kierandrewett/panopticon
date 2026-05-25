@@ -57,48 +57,6 @@ fn save_state(state: &State) {
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(load_state()));
 
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .expect("failed to build webhook HTTP client")
-});
-
-/// POST a state-change notification to `WEBHOOK_URL` if configured. Fire and
-/// forget — the request runs on a detached task and failures are logged.
-fn fire_webhook(
-    device: String,
-    event: &'static str,
-    reason: &'static str,
-    aggregate_active: bool,
-) {
-    let url = match std::env::var("WEBHOOK_URL") {
-        Ok(u) if !u.is_empty() => u,
-        _ => return,
-    };
-    let payload = serde_json::json!({
-        "device": device,
-        "event": event,
-        "reason": reason,
-        "aggregate_active": aggregate_active,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-    });
-    tokio::spawn(async move {
-        match HTTP_CLIENT.post(&url).json(&payload).send().await {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    tracing::warn!(
-                        "Webhook {} returned status {}",
-                        url,
-                        resp.status()
-                    );
-                }
-            }
-            Err(e) => tracing::warn!("Webhook to {} failed: {}", url, e),
-        }
-    });
-}
-
 #[derive(Deserialize, Default)]
 struct UpdateRequest {
     /// 1 (or omitted) = device is here. 0 = remove this device immediately.
@@ -310,15 +268,11 @@ async fn update_status(
     let mut state = STATE.lock().await;
     let now = chrono::Utc::now();
 
-    let mut transition: Option<(&'static str, &'static str)> = None;
-
     if status == 0 {
         if state.devices.remove(&device_id).is_some() {
             tracing::info!("Device '{}' delisted", device_id);
-            transition = Some(("off", "explicit"));
         }
     } else {
-        let was_present = state.devices.contains_key(&device_id);
         let ttl_seconds = req
             .ttl
             .filter(|n| *n > 0)
@@ -331,22 +285,10 @@ async fn update_status(
             },
         );
         tracing::debug!("Device '{}' refreshed (ttl {}s)", device_id, ttl_seconds);
-        if !was_present {
-            transition = Some(("on", "ping"));
-        }
     }
 
-    let outcome = refresh_aggregate(&mut state, now);
+    refresh_aggregate(&mut state, now);
     save_state(&state);
-    let aggregate_active = outcome.active;
-    drop(state);
-
-    if let Some((event, reason)) = transition {
-        fire_webhook(device_id, event, reason, aggregate_active);
-    }
-    for name in outcome.pruned {
-        fire_webhook(name, "off", "expired", aggregate_active);
-    }
 
     "ok".into_response()
 }
@@ -388,9 +330,6 @@ async fn get_status(
     let since_dt = outcome.since;
     if prev_active != active || !outcome.pruned.is_empty() {
         save_state(&state);
-    }
-    for name in &outcome.pruned {
-        fire_webhook(name.clone(), "off", "expired", active);
     }
 
     let result = if active { "yes" } else { "no" };

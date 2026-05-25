@@ -7,7 +7,6 @@ services:
       - TOKEN=${TOKEN}
       - PORT=3000
       - DATA_DIR=/data
-      - WEBHOOK_URL=${WEBHOOK_URL:-}
     volumes:
       - data:/data
     restart: unless-stopped
